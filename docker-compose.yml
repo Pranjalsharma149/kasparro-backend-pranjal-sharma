@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  db:
+    # (Existing 'db' service block remains the same - it's perfect)
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pranjal12
+      POSTGRES_DB: kasparro
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d kasparro"] 
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    # (Existing 'app' service block remains the same - it's perfect for the API)
+    build: . 
+    restart: on-failure
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/kasparro
+      PYTHONPATH: /app 
+      # ... other environment variables ...
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 
+
+  # --- NEW: Dedicated ETL Service (P0.3, P1.3) ---
+  etl:
+    build: . # Reuse the same image built by the Dockerfile
+    # This service must wait for the DB, but NOT the API
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/kasparro
+      PYTHONPATH: /app 
+      # P0.1 - Include the API Key here for security separation
+      EXTERNAL_API_KEY: ${EXTERNAL_API_KEY} 
+    # CRITICAL: This command runs the table setup and the ETL script
+    command: sh -c "python initialize_db.py && python ingestion/etl_main.py"
+    # Set to 'no' so it doesn't continuously restart after a successful run.
+    # In a real system, this would be triggered by a scheduler (like cron/Airflow).
+    restart: "no" 
+    
+# Global definition of the named volume for PostgreSQL data
+volumes:
+  postgres_data:
