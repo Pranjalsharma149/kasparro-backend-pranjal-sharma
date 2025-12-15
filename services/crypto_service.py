@@ -1,60 +1,107 @@
-# services/crypto_service.py
-
 from sqlalchemy.orm import Session
+from sqlalchemy import func, desc
 from typing import Optional, List, Tuple
-import requests
 from fastapi import HTTPException
-from datetime import datetime 
+import httpx 
+import logging
+from datetime import datetime
 
-# --- Configuration ---
-COINPAPRIKA_API_URL = "https://api.coinpaprika.com/v1/coins"
+# --- CRITICAL IMPORTS ---
+from models.etl_models import NormalizedMarketData, ETLCheckpoint # DB Models
+
+logger = logging.getLogger(__name__)
+
+# --- Configuration for ETL (External API URLs) ---
+COINPAPRIKA_API_URL = "https://api.coinpaprika.com/v1/tickers" 
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 # =========================================================
-# 1. Internal Data Service (Fixed & Working)
+# 1. Internal Data Service (Reads from DB for API)
 # =========================================================
-def get_market_data(db: Session, limit: int, offset: int, symbol: Optional[str]) -> Tuple[List[dict], int]:
+def get_market_data(db: Session, limit: int, offset: int, symbol: Optional[str]) -> Tuple[List[NormalizedMarketData], int]:
     """
-    Retrieves paginated and filtered market data.
-    Currently returns MOCK data until you connect the real DB query.
+    Retrieves paginated and filtered market data directly from PostgreSQL.
+    Used by your FastAPI endpoint (/market-data).
     """
     
-    # --- TEMPORARY Mock Data ---
-    # In the future, you will replace this with: db.query(NormalizedMarketData)...
-    total_count = 100 
-    data_list = [
-        {
-            "asset_id": "mock_id", 
-            "symbol": "MOCK", 
-            "price_usd": 1.0, 
-            "last_updated": datetime.now()
-        }
-    ] 
+    # 1. Build the Query
+    query = db.query(NormalizedMarketData)
+
+    # 2. Apply Filter 
+    if symbol:
+        # Filter for the symbol (case-insensitive)
+        query = query.filter(NormalizedMarketData.symbol.ilike(f"%{symbol}%"))
+
+    # 3. Get Total Count (Required for pagination metadata)
+    total_count = query.count()
+
+    # 4. Fetch the Data
+    # Sort by Market Cap (descending) 
+    data_list = query.order_by(desc(NormalizedMarketData.market_cap_usd)) \
+                      .offset(offset) \
+                      .limit(limit) \
+                      .all()
     
     return data_list, total_count
 
-# =========================================================
-# 2. CoinPaprika Service (Fixed & Working)
-# =========================================================
-def fetch_coinpaprika_data() -> List[dict]:
-    """Retrieves raw market data from CoinPaprika with error handling."""
-    try:
-        response = requests.get(COINPAPRIKA_API_URL, timeout=10) 
-        response.raise_for_status() 
-        return response.json()
-    
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="CoinPaprika API request timed out.")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"CoinPaprika API request failed: {e.__class__.__name__}")
 
 # =========================================================
-# 3. CoinGecko Service (FIXED THIS SECTION)
+# 2. ETL Stats Service (Reads from DB for /stats API)
 # =========================================================
-def fetch_coingecko_data() -> List[dict]:
-    """Retrieves raw market data from CoinGecko with error handling."""
+def get_etl_stats_service(db: Session) -> List[ETLCheckpoint]:
+    """
+    Retrieves the run status records from the ETLCheckpoint table.
+    Used by your FastAPI endpoint (/stats).
+    """
+    # Query all records from the ETLCheckpoint table
+    stats = db.query(ETLCheckpoint).all()
     
-    # CoinGecko requires specific parameters for the /coins/markets endpoint
+    return stats
+
+
+# =========================================================
+# 3. CoinPaprika Service (Async Fetch + Normalize - Used by ETL script)
+# =========================================================
+async def fetch_coinpaprika_data() -> List[dict]:
+    """
+    Asynchronously fetches and NORMALIZES data from CoinPaprika.
+    """
+    # ... (Keep the rest of your original CoinPaprika fetch/normalize logic here) ...
+    params = {"limit": 10}
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(COINPAPRIKA_API_URL, params=params, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            
+            normalized_data = []
+            for coin in data:
+                normalized_data.append({
+                    "source_record_id": coin["id"],
+                    "source_name": "coinpaprika",
+                    "symbol": coin["symbol"].upper(),
+                    "name": coin["name"],
+                    "current_price_usd": coin.get("quotes", {}).get("USD", {}).get("price", 0),
+                    "market_cap_usd": coin.get("quotes", {}).get("USD", {}).get("market_cap", 0),
+                    "volume_24h_usd": coin.get("quotes", {}).get("USD", {}).get("volume_24h", 0),
+                    "percent_change_24h": coin.get("quotes", {}).get("USD", {}).get("percent_change_24h", 0),
+                    "last_updated_at": coin["last_updated"]
+                })
+            return normalized_data
+
+        except Exception as e:
+            logger.error(f"Error fetching CoinPaprika data: {e}")
+            return []
+
+# =========================================================
+# 4. CoinGecko Service (Async Fetch + Normalize - Used by ETL script)
+# =========================================================
+async def fetch_coingecko_data() -> List[dict]:
+    """
+    Asynchronously fetches and NORMALIZES data from CoinGecko.
+    """
+    # ... (Keep the rest of your original CoinGecko fetch/normalize logic here) ...
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
@@ -63,18 +110,27 @@ def fetch_coingecko_data() -> List[dict]:
         "sparkline": "false"
     }
     
-    # CoinGecko often blocks requests without a User-Agent
-    headers = {
-        "User-Agent": "KasparroBot/1.0"
-    }
-
-    try:
-        response = requests.get(COINGECKO_API_URL, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        return response.json()
-        
-    except requests.exceptions.RequestException as e:
-        print(f"CoinGecko API Error: {e}")
-        # Return an empty list instead of crashing if the API fails
-        # This satisfies the "List" requirement of the response schema
-        return []
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(COINGECKO_API_URL, params=params, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            
+            normalized_data = []
+            for coin in data:
+                normalized_data.append({
+                    "source_record_id": coin["id"],
+                    "source_name": "coingecko",
+                    "symbol": coin["symbol"].upper(),
+                    "name": coin["name"],
+                    "current_price_usd": coin["current_price"],
+                    "market_cap_usd": coin["market_cap"],
+                    "volume_24h_usd": coin["total_volume"],
+                    "percent_change_24h": coin["price_change_percentage_24h"],
+                    "last_updated_at": coin["last_updated"]
+                })
+            return normalized_data
+            
+        except Exception as e:
+            logger.error(f"Error fetching CoinGecko data: {e}")
+            return []

@@ -1,19 +1,23 @@
-# schemas/normalized.py
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
-# Assuming your actual market data objects are defined somewhere else, 
-# for now, we'll use a placeholder or define a simple one.
-# If you have a CoinMarketData model, replace 'BaseModel' below with it.
 class MarketData(BaseModel):
-    # This should match the structure of your normalized database model/result
-    asset_id: Optional[str] = None
+    """
+    Schema matches the 'normalized_data' table in database.
+    """
+    source_record_id: str
+    source_name: str
     symbol: str
-    price_usd: float
-    last_updated: datetime
-    # ... add other fields as necessary (e.g., volume, market_cap)
-    pass 
+    name: str
+    current_price_usd: float
+    market_cap_usd: float
+    volume_24h_usd: float
+    percent_change_24h: float
+    last_updated_at: Optional[datetime]
+
+    # critical: allows pydantic to read sqlalchemy objects
+    model_config = ConfigDict(from_attributes=True)
 
 class PaginationMetadata(BaseModel):
     request_id: str
@@ -21,7 +25,7 @@ class PaginationMetadata(BaseModel):
     total_records: int
     limit: int
     offset: int
-    filter_applied: Dict[str, Optional[Any]] = {} # Dictionary to hold filters (e.g., symbol)
+    filter_applied: Dict[str, Optional[Any]] = {}
 
 class PaginatedResponse(BaseModel):
     """The final response structure for paginated data."""
